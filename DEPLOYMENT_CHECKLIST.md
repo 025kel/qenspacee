@@ -1,3 +1,4 @@
+[DEPLOYMENT_CHECKLIST.md](https://github.com/user-attachments/files/34145702/DEPLOYMENT_CHECKLIST.md)
 # QenSpace hosting checklist
 
 - [ ] Node.js 20+ available
