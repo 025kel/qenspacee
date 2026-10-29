@@ -1,3 +1,4 @@
+[README.md](https://github.com/user-attachments/files/34145723/README.md)
 # QenSpace Solutions and Mobile Repairs — Node.js Shop Management System
 
 This is a server-backed first release intended for a small shop. It replaces browser-only prototype storage with a Node.js/Express API and SQLite database. Admin and attendant permissions are checked on the server, passwords are hashed with bcrypt, and browser sessions are stored in SQLite.
@@ -96,3 +97,15 @@ Render's menus and pricing may change. Review the hosting provider's current per
 - `server.js` — Express server, database schema, authentication, authorization and API routes.
 - `public/index.html` — responsive user interface for admin and attendant portals.
 - `.env.example` — configuration template.
+
+## Customer portal (added)
+
+- Public customer page: `/customer`.
+- Customers can request repair appointments, ask a technician a question, and check a request using its reference number plus the same phone number used to submit it.
+- WhatsApp contact link is configured for **+254 700 776 060**.
+- Signed-in staff can use **Customer Portal** in the staff dashboard to confirm/reschedule/decline appointments and respond to questions.
+- Customer request tables are created automatically on app startup. Existing users, password hashes, inventory, sales, repair jobs and other business records are not dropped or reset.
+- JSON backup now includes `customer_appointments` and `customer_enquiries`.
+- Public submissions have rate limiting and basic input validation. This MVP does not send automatic WhatsApp messages, SMS reminders, or email notifications; staff must contact customers manually. A reference and phone-number check is used for customer lookups, so customers should keep references private.
+
+After deploying, test `/customer`, submit a test booking and question, then sign into the staff dashboard and process both. Download a new backup after testing. Do not change `DB_PATH` or reset the existing database during deployment.
