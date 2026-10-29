@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
@@ -9,20 +8,9 @@ const bcrypt = require('bcryptjs');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const app = express();
-function kenyaDate() {
-  const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Africa/Nairobi',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).formatToParts(new Date());
-
-  const p = Object.fromEntries(parts.map(x => [x.type, x.value]));
-  return `${p.year}-${p.month}-${p.day}`;
-}
-app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT || 3000);
 if (process.env.NODE_ENV === 'production' && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) {
   throw new Error('Set SESSION_SECRET to a unique random value of at least 32 characters in production.');
@@ -86,6 +74,23 @@ CREATE TABLE IF NOT EXISTS audit_log (
  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, action TEXT NOT NULL,
  details TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS customer_appointments (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, reference TEXT UNIQUE NOT NULL,
+ customer_name TEXT NOT NULL, phone TEXT NOT NULL, device_type TEXT NOT NULL,
+ device_brand TEXT DEFAULT '', device_model TEXT DEFAULT '', issue TEXT NOT NULL,
+ preferred_date TEXT NOT NULL, preferred_time TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Pending confirmation',
+ staff_notes TEXT DEFAULT '', handled_by INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ FOREIGN KEY(handled_by) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS customer_enquiries (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, reference TEXT UNIQUE NOT NULL,
+ customer_name TEXT NOT NULL, phone TEXT NOT NULL, topic TEXT NOT NULL,
+ question TEXT NOT NULL, response TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'New',
+ handled_by INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ FOREIGN KEY(handled_by) REFERENCES users(id)
+);
 `);
 
 const cents = value => {
@@ -124,6 +129,68 @@ app.use(session({
  cookie: { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 1000*60*60*10 }
 }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+
+// Public customer portal. Customer lookups require both reference and phone number.
+const customerLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 12, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many requests. Please wait a little and try again.' } });
+const cleanText = (value, max=1000) => String(value || '').trim().slice(0,max);
+const newCustomerRef = prefix => `${prefix}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+const validPhone = value => /^\+?[0-9 ()-]{9,20}$/.test(String(value || '').trim());
+app.get('/customer', (req,res) => res.sendFile(path.join(__dirname,'public','customer.html')));
+app.post('/api/customer/appointments', customerLimiter, wrap((req,res) => {
+ const b=req.body;
+ const customerName=cleanText(b.customerName,100), phone=cleanText(b.phone,30), deviceType=cleanText(b.deviceType,60), issue=cleanText(b.issue,1200);
+ const preferredDate=cleanText(b.preferredDate,10), preferredTime=cleanText(b.preferredTime,5);
+ if(!customerName||!phone||!deviceType||!issue||!preferredDate||!preferredTime) throw new Error('Please complete all required booking fields.');
+ if(!validPhone(phone)) throw new Error('Enter a valid phone number, including country code if possible.');
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(preferredDate)||Number.isNaN(Date.parse(preferredDate+'T00:00:00Z'))) throw new Error('Choose a valid preferred date.');
+ if(preferredDate < new Date().toLocaleDateString('en-CA',{timeZone:'Africa/Nairobi'})) throw new Error('The preferred date cannot be in the past.');
+ if(!/^(09|1[0-9]|2[0-3]):[0-5][0-9]$/.test(preferredTime) && !/^0[8-9]:[0-5][0-9]$/.test(preferredTime)) throw new Error('Choose a time between 08:00 and 23:59.');
+ let reference; do { reference=newCustomerRef('QSA'); } while(db.prepare('SELECT 1 FROM customer_appointments WHERE reference=?').get(reference));
+ const r=db.prepare(`INSERT INTO customer_appointments(reference,customer_name,phone,device_type,device_brand,device_model,issue,preferred_date,preferred_time)
+ VALUES(?,?,?,?,?,?,?,?,?)`).run(reference,customerName,phone,deviceType,cleanText(b.deviceBrand,80),cleanText(b.deviceModel,100),issue,preferredDate,preferredTime);
+ res.status(201).json({reference, status:'Pending confirmation', message:'Your appointment request has been received. The shop will contact you to confirm the time.'});
+}));
+app.post('/api/customer/enquiries', customerLimiter, wrap((req,res) => {
+ const b=req.body, customerName=cleanText(b.customerName,100), phone=cleanText(b.phone,30), topic=cleanText(b.topic,80), question=cleanText(b.question,1500);
+ if(!customerName||!phone||!topic||!question) throw new Error('Please complete all required question fields.');
+ if(!validPhone(phone)) throw new Error('Enter a valid phone number, including country code if possible.');
+ let reference; do { reference=newCustomerRef('QSE'); } while(db.prepare('SELECT 1 FROM customer_enquiries WHERE reference=?').get(reference));
+ db.prepare('INSERT INTO customer_enquiries(reference,customer_name,phone,topic,question) VALUES(?,?,?,?,?)').run(reference,customerName,phone,topic,question);
+ res.status(201).json({reference,status:'New',message:'Your question has been sent. Keep your reference number to check the response.'});
+}));
+app.post('/api/customer/lookup', customerLimiter, wrap((req,res) => {
+ const reference=cleanText(req.body.reference,30).toUpperCase(), phone=cleanText(req.body.phone,30);
+ if(!reference||!phone) throw new Error('Enter both your reference number and phone number.');
+ const a=db.prepare('SELECT reference,customer_name,device_type,device_brand,device_model,preferred_date,preferred_time,status,staff_notes,created_at,updated_at FROM customer_appointments WHERE reference=? AND phone=?').get(reference,phone);
+ if(a) return res.json({type:'appointment',record:a});
+ const e=db.prepare('SELECT reference,customer_name,topic,question,response,status,created_at,updated_at FROM customer_enquiries WHERE reference=? AND phone=?').get(reference,phone);
+ if(e) return res.json({type:'enquiry',record:e});
+ res.status(404).json({error:'We could not find a request matching that reference and phone number.'});
+}));
+app.get('/api/staff/customer-requests', signedIn, (req,res) => {
+ const appointments=db.prepare(`SELECT * FROM customer_appointments ORDER BY CASE status WHEN 'Pending confirmation' THEN 0 WHEN 'Confirmed' THEN 1 ELSE 2 END, preferred_date, preferred_time, id DESC LIMIT 300`).all();
+ const enquiries=db.prepare(`SELECT * FROM customer_enquiries ORDER BY CASE status WHEN 'New' THEN 0 WHEN 'In Progress' THEN 1 ELSE 2 END, id DESC LIMIT 300`).all();
+ res.json({appointments,enquiries});
+});
+app.patch('/api/staff/customer-appointments/:id', signedIn, wrap((req,res) => {
+ const old=db.prepare('SELECT * FROM customer_appointments WHERE id=?').get(req.params.id); if(!old) throw new Error('Appointment not found.');
+ const allowed=['Pending confirmation','Confirmed','Reschedule requested','Declined','Completed','Cancelled'];
+ const status=req.body.status==null?old.status:cleanText(req.body.status,40); if(!allowed.includes(status)) throw new Error('Invalid appointment status.');
+ const date=req.body.preferredDate==null?old.preferred_date:cleanText(req.body.preferredDate,10), time=req.body.preferredTime==null?old.preferred_time:cleanText(req.body.preferredTime,5), notes=req.body.staffNotes==null?old.staff_notes:cleanText(req.body.staffNotes,1000);
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) throw new Error('Enter a valid date and time.');
+ if(status==='Confirmed') { const clash=db.prepare(`SELECT id FROM customer_appointments WHERE id<>? AND preferred_date=? AND preferred_time=? AND status='Confirmed'`).get(old.id,date,time); if(clash) throw new Error('Another appointment is already confirmed for that date and time.'); }
+ db.prepare('UPDATE customer_appointments SET status=?,preferred_date=?,preferred_time=?,staff_notes=?,handled_by=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status,date,time,notes,req.session.user.id,old.id);
+ log(req.session.user.id,'CUSTOMER_APPOINTMENT_UPDATED',`${old.reference}; status=${status}`); res.json({ok:true});
+}));
+app.patch('/api/staff/customer-enquiries/:id', signedIn, wrap((req,res) => {
+ const old=db.prepare('SELECT * FROM customer_enquiries WHERE id=?').get(req.params.id); if(!old) throw new Error('Customer question not found.');
+ const allowed=['New','In Progress','Answered','Closed']; const status=req.body.status==null?old.status:cleanText(req.body.status,30); if(!allowed.includes(status)) throw new Error('Invalid question status.');
+ const response=req.body.response==null?old.response:cleanText(req.body.response,1500);
+ if(status==='Answered'&&!response) throw new Error('Write a response before marking the question answered.');
+ db.prepare('UPDATE customer_enquiries SET status=?,response=?,handled_by=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status,response,req.session.user.id,old.id);
+ log(req.session.user.id,'CUSTOMER_ENQUIRY_UPDATED',`${old.reference}; status=${status}`); res.json({ok:true});
+}));
 
 app.get('/api/health', (req,res) => res.json({ok:true, app:'QenSpace Shop Management System'}));
 app.get('/api/me', (req,res) => res.json({user:req.session.user || null, shopName:process.env.SHOP_NAME || 'QenSpace Solutions and Mobile Repairs'}));
@@ -261,7 +328,7 @@ app.patch('/api/users/:id', signedIn, adminOnly, wrap((req,res) => {
 }));
 app.get('/api/audit', signedIn, adminOnly, (req,res) => res.json(db.prepare('SELECT a.*,u.username FROM audit_log a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 300').all()));
 app.get('/api/backup', signedIn, adminOnly, (req,res) => {
- const tables=['users','products','sales','sale_items','repairs','mpesa_transactions','expenses','audit_log'];
+ const tables=['users','products','sales','sale_items','repairs','mpesa_transactions','expenses','audit_log','customer_appointments','customer_enquiries'];
  const backup={app:'QenSpace Shop Management System',createdAt:new Date().toISOString(),tables:{}};
  for(const t of tables) backup.tables[t]=db.prepare(`SELECT * FROM ${t}`).all();
  res.setHeader('Content-Disposition', `attachment; filename=qenspace-backup-${new Date().toISOString().slice(0,10)}.json`);
