@@ -11,8 +11,8 @@ const fs = require('fs');
 const crypto = require('crypto');
 
 const app = express();
-// Render terminates HTTPS at its proxy. Trust the proxy so secure session cookies work.
-if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
+// Render terminates HTTPS at its proxy; trust the first proxy so secure session cookies work.
+app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT || 3000);
 if (process.env.NODE_ENV === 'production' && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) {
   throw new Error('Set SESSION_SECRET to a unique random value of at least 32 characters in production.');
@@ -95,12 +95,53 @@ CREATE TABLE IF NOT EXISTS customer_enquiries (
 );
 `);
 
+// Safe, additive migrations: never drop or recreate existing business tables.
+const saleItemColumns = db.prepare('PRAGMA table_info(sale_items)').all().map(c => c.name);
+if (!saleItemColumns.includes('unit_cost_cents')) {
+ db.exec('ALTER TABLE sale_items ADD COLUMN unit_cost_cents INTEGER NOT NULL DEFAULT 0');
+}
+const saleItemColumnsAfterCost = db.prepare('PRAGMA table_info(sale_items)').all().map(c => c.name);
+if (!saleItemColumnsAfterCost.includes('cost_snapshot_known')) {
+ db.exec('ALTER TABLE sale_items ADD COLUMN cost_snapshot_known INTEGER NOT NULL DEFAULT 0');
+}
+
 const cents = value => {
  const n = Number(value);
  if (!Number.isFinite(n) || n < 0) throw new Error('Enter a valid non-negative amount.');
  return Math.round(n * 100);
 };
 const money = n => (Number(n || 0) / 100).toFixed(2);
+// Provisional published 2026 agent-commission bands. Safaricom's current official
+// agent commission chart could not be independently located publicly; verify against
+// the outlet's latest Safaricom/aggregator commission statement before relying on it.
+// This is agent commission (not customer withdrawal fees).
+const MPESA_AGENT_BANDS = [
+ {min:50,max:100,deposit:4,withdrawal:5},
+ {min:101,max:500,deposit:8,withdrawal:8},
+ {min:501,max:1000,deposit:9,withdrawal:10},
+ {min:1001,max:1500,deposit:10,withdrawal:12},
+ {min:1501,max:2500,deposit:11,withdrawal:15},
+ {min:2501,max:3500,deposit:12,withdrawal:20},
+ {min:3501,max:5000,deposit:14,withdrawal:25},
+ {min:5001,max:7500,deposit:20,withdrawal:30},
+ {min:7501,max:10000,deposit:28,withdrawal:35},
+ {min:10001,max:15000,deposit:40,withdrawal:45},
+ {min:15001,max:20000,deposit:55,withdrawal:60},
+ {min:20001,max:25000,deposit:71,withdrawal:65},
+ {min:25001,max:30000,deposit:87,withdrawal:70},
+ {min:30001,max:35000,deposit:103,withdrawal:70},
+ {min:35001,max:40000,deposit:119,withdrawal:100},
+ {min:40001,max:45000,deposit:135,withdrawal:150},
+ {min:45001,max:50000,deposit:150,withdrawal:180},
+ {min:50001,max:70000,deposit:190,withdrawal:200}
+];
+function calculateMpesaCommission(type, amountCents) {
+ if (type === 'OTHER') return {commissionCents:0, matched:false};
+ const amount = Number(amountCents || 0) / 100;
+ const band = MPESA_AGENT_BANDS.find(b => amount >= b.min && amount <= b.max);
+ if (!band) return {commissionCents:0, matched:false};
+ return {commissionCents:Math.round((type === 'DEPOSIT' ? band.deposit : band.withdrawal) * 100), matched:true, band:{min:band.min,max:band.max}};
+}
 const log = (userId, action, details='') => db.prepare('INSERT INTO audit_log(user_id,action,details) VALUES(?,?,?)').run(userId || null, action, String(details).slice(0,500));
 const safeUser = u => ({ id:u.id, username:u.username, displayName:u.display_name, role:u.role });
 const adminOnly = (req,res,next) => req.session.user?.role === 'admin' ? next() : res.status(403).json({error:'Administrator permission required.'});
@@ -206,9 +247,8 @@ app.post('/api/login', loginLimiter, wrap((req,res) => {
   if (err) return res.status(500).json({error:'Could not create session.'});
   req.session.user = safeUser(user);
   log(user.id,'LOGIN','Signed in');
-  // Persist the session before replying, so the dashboard's next request can use it.
   req.session.save(saveErr => {
-   if (saveErr) { console.error('Session save failed:', saveErr); return res.status(500).json({error:'Could not save sign-in session. Please try again.'}); }
+   if (saveErr) return res.status(500).json({error:'Could not save sign-in session.'});
    res.json({user:req.session.user});
   });
  });
@@ -218,11 +258,12 @@ app.post('/api/logout', signedIn, (req,res) => { const id=req.session.user.id; l
 app.get('/api/dashboard', signedIn, (req,res) => {
  const today = new Date().toISOString().slice(0,10);
  const sales = db.prepare("SELECT COALESCE(SUM(total_cents),0) n, COUNT(*) c FROM sales WHERE date(created_at)=?").get(today);
+ const profitToday = db.prepare("SELECT COALESCE(SUM(s.total_cents-(SELECT SUM(si.unit_cost_cents*si.quantity) FROM sale_items si WHERE si.sale_id=s.id)),0) n FROM sales s WHERE date(s.created_at)=? AND NOT EXISTS (SELECT 1 FROM sale_items si WHERE si.sale_id=s.id AND si.cost_snapshot_known=0)").get(today).n;
  const low = db.prepare('SELECT COUNT(*) n FROM products WHERE active=1 AND quantity<=reorder_level').get().n;
  const openRepairs = db.prepare("SELECT COUNT(*) n FROM repairs WHERE status NOT IN ('Collected','Cancelled')").get().n;
  const mpesa = db.prepare("SELECT COALESCE(SUM(commission_cents),0) n FROM mpesa_transactions WHERE date(created_at)=?").get(today).n;
  const recent = db.prepare('SELECT s.receipt_no,s.total_cents,s.payment_method,s.created_at,u.display_name FROM sales s JOIN users u ON u.id=s.user_id ORDER BY s.id DESC LIMIT 8').all();
- res.json({salesToday:money(sales.n),salesCount:sales.c,lowStock:low,openRepairs,commissionToday:money(mpesa),recent:recent.map(x=>({...x,total:money(x.total_cents)}))});
+ res.json({salesToday:money(sales.n),salesCount:sales.c,grossProfitToday:money(profitToday),lowStock:low,openRepairs,commissionToday:money(mpesa),recent:recent.map(x=>({...x,total:money(x.total_cents)}))});
 });
 
 app.get('/api/products', signedIn, (req,res) => {
@@ -259,24 +300,24 @@ app.post('/api/sales', signedIn, wrap((req,res) => {
    const qty=Number(item.quantity); if(!Number.isInteger(qty)||qty<1) throw new Error('Each quantity must be a positive whole number.');
    const p=db.prepare('SELECT * FROM products WHERE id=? AND active=1').get(Number(item.productId));
    if(!p) throw new Error('A selected product is no longer available.'); if(p.quantity<qty) throw new Error(`Not enough stock for ${p.name}. Available: ${p.quantity}.`);
-   const line=qty*p.price_cents; total+=line; lines.push({p,qty,line});
+   const line=qty*p.price_cents; total+=line; lines.push({p,qty,line,cost:p.cost_cents});
   }
   const paid=req.body.paidAmount===''||req.body.paidAmount==null?total:cents(req.body.paidAmount);
   if(paid>total) throw new Error('Amount paid cannot exceed the sale total.');
   const receipt='QS-'+new Date().toISOString().slice(2,10).replaceAll('-','')+'-'+Date.now().toString().slice(-6);
   const sale=db.prepare('INSERT INTO sales(receipt_no,total_cents,paid_cents,payment_method,customer_name,notes,user_id) VALUES(?,?,?,?,?,?,?)')
    .run(receipt,total,paid,method,String(req.body.customerName||''),String(req.body.notes||''),req.session.user.id);
-  for(const l of lines){ db.prepare('INSERT INTO sale_items(sale_id,product_id,product_name,quantity,unit_price_cents,line_total_cents) VALUES(?,?,?,?,?,?)').run(sale.lastInsertRowid,l.p.id,l.p.name,l.qty,l.p.price_cents,l.line); db.prepare('UPDATE products SET quantity=quantity-? WHERE id=?').run(l.qty,l.p.id); }
-  log(req.session.user.id,'SALE_CREATED',`${receipt}; total=${money(total)}`); return {id:sale.lastInsertRowid,receiptNo:receipt,total:money(total),paid:money(paid),balance:money(total-paid)};
+  for(const l of lines){ db.prepare('INSERT INTO sale_items(sale_id,product_id,product_name,quantity,unit_price_cents,line_total_cents,unit_cost_cents,cost_snapshot_known) VALUES(?,?,?,?,?,?,?,1)').run(sale.lastInsertRowid,l.p.id,l.p.name,l.qty,l.p.price_cents,l.line,l.cost); db.prepare('UPDATE products SET quantity=quantity-? WHERE id=?').run(l.qty,l.p.id); }
+  const costTotal=lines.reduce((sum,l)=>sum+l.cost*l.qty,0); const grossProfit=total-costTotal; log(req.session.user.id,'SALE_CREATED',`${receipt}; total=${money(total)}; grossProfit=${money(grossProfit)}`); return {id:sale.lastInsertRowid,receiptNo:receipt,total:money(total),paid:money(paid),balance:money(total-paid),costOfGoodsSold:money(costTotal),grossProfit:money(grossProfit)};
  }); res.status(201).json(create());
 }));
 app.get('/api/sales', signedIn, (req,res) => {
  const rows=db.prepare('SELECT s.*,u.display_name FROM sales s JOIN users u ON u.id=s.user_id ORDER BY s.id DESC LIMIT 200').all();
- res.json(rows.map(s=>({...s,total:money(s.total_cents),paid:money(s.paid_cents),items:db.prepare('SELECT product_name,quantity,unit_price_cents,line_total_cents FROM sale_items WHERE sale_id=?').all(s.id).map(i=>({...i,unitPrice:money(i.unit_price_cents),lineTotal:money(i.line_total_cents)}))})));
+ res.json(rows.map(s=>({...s,total:money(s.total_cents),paid:money(s.paid_cents),items:db.prepare('SELECT product_name,quantity,unit_price_cents,line_total_cents,unit_cost_cents,cost_snapshot_known FROM sale_items WHERE sale_id=?').all(s.id).map(i=>({...i,unitPrice:money(i.unit_price_cents),lineTotal:money(i.line_total_cents),unitCost:money(i.unit_cost_cents),grossProfit:i.cost_snapshot_known?money(i.line_total_cents-(i.unit_cost_cents*i.quantity)):null,costSnapshotKnown:!!i.cost_snapshot_known})),costOfGoodsSold:db.prepare('SELECT COUNT(*) n FROM sale_items WHERE sale_id=? AND cost_snapshot_known=0').get(s.id).n?null:money(db.prepare('SELECT COALESCE(SUM(unit_cost_cents*quantity),0) n FROM sale_items WHERE sale_id=?').get(s.id).n),grossProfit:db.prepare('SELECT COUNT(*) n FROM sale_items WHERE sale_id=? AND cost_snapshot_known=0').get(s.id).n?null:money(s.total_cents-db.prepare('SELECT COALESCE(SUM(unit_cost_cents*quantity),0) n FROM sale_items WHERE sale_id=?').get(s.id).n)})));
 });
 app.get('/api/sales/:id', signedIn, (req,res) => {
  const s=db.prepare('SELECT s.*,u.display_name FROM sales s JOIN users u ON u.id=s.user_id WHERE s.id=?').get(req.params.id); if(!s)return res.status(404).json({error:'Sale not found.'});
- res.json({...s,total:money(s.total_cents),paid:money(s.paid_cents),items:db.prepare('SELECT product_name,quantity,unit_price_cents,line_total_cents FROM sale_items WHERE sale_id=?').all(s.id).map(i=>({...i,unitPrice:money(i.unit_price_cents),lineTotal:money(i.line_total_cents)}))});
+ res.json({...s,total:money(s.total_cents),paid:money(s.paid_cents),items:db.prepare('SELECT product_name,quantity,unit_price_cents,line_total_cents,unit_cost_cents,cost_snapshot_known FROM sale_items WHERE sale_id=?').all(s.id).map(i=>({...i,unitPrice:money(i.unit_price_cents),lineTotal:money(i.line_total_cents),unitCost:money(i.unit_cost_cents),grossProfit:i.cost_snapshot_known?money(i.line_total_cents-(i.unit_cost_cents*i.quantity)):null,costSnapshotKnown:!!i.cost_snapshot_known})),costOfGoodsSold:db.prepare('SELECT COUNT(*) n FROM sale_items WHERE sale_id=? AND cost_snapshot_known=0').get(s.id).n?null:money(db.prepare('SELECT COALESCE(SUM(unit_cost_cents*quantity),0) n FROM sale_items WHERE sale_id=?').get(s.id).n),grossProfit:db.prepare('SELECT COUNT(*) n FROM sale_items WHERE sale_id=? AND cost_snapshot_known=0').get(s.id).n?null:money(s.total_cents-db.prepare('SELECT COALESCE(SUM(unit_cost_cents*quantity),0) n FROM sale_items WHERE sale_id=?').get(s.id).n)});
 });
 
 app.get('/api/repairs', signedIn, (req,res) => res.json(db.prepare('SELECT r.*,u.display_name FROM repairs r JOIN users u ON u.id=r.user_id ORDER BY r.id DESC LIMIT 300').all().map(r=>({...r,quote:money(r.quote_cents),paid:money(r.paid_cents),balance:money(Math.max(0,r.quote_cents-r.paid_cents))}))));
@@ -296,13 +337,21 @@ app.patch('/api/repairs/:id', signedIn, wrap((req,res) => {
  log(req.session.user.id,'REPAIR_UPDATED',`${old.job_no}; status=${status}`); res.json({ok:true});
 }));
 
+app.get('/api/mpesa/rates', signedIn, (req,res) => res.json({source:'Provisional 2026 published agent-commission bands; confirm against your latest Safaricom/aggregator statement.',verifiedOfficial:false,bands:MPESA_AGENT_BANDS}));
+app.post('/api/mpesa/estimate', signedIn, wrap((req,res) => {
+ const type=String(req.body.type||'').toUpperCase(); if(!['DEPOSIT','WITHDRAWAL','OTHER'].includes(type))throw new Error('Choose Deposit, Withdrawal or Other.');
+ const amountCents=cents(req.body.amount); const result=calculateMpesaCommission(type,amountCents);
+ res.json({commission:money(result.commissionCents),matched:result.matched,band:result.band||null,warning:result.matched?'Indicative rate: confirm against your official agent statement.':'No commission band configured for this amount/type; verify the rate before saving.'});
+}));
 app.get('/api/mpesa', signedIn, (req,res) => res.json(db.prepare('SELECT m.*,u.display_name FROM mpesa_transactions m JOIN users u ON u.id=m.user_id ORDER BY m.id DESC LIMIT 300').all().map(m=>({...m,amount:money(m.amount_cents),commission:money(m.commission_cents)}))));
 app.post('/api/mpesa', signedIn, wrap((req,res) => {
  const b=req.body; const ref=String(b.reference||'').trim(); if(!ref)throw new Error('M-Pesa transaction reference is required.');
  const type=String(b.type||'').toUpperCase(); if(!['DEPOSIT','WITHDRAWAL','OTHER'].includes(type))throw new Error('Choose Deposit, Withdrawal or Other.');
+ const amountCents=cents(b.amount); const calculated=calculateMpesaCommission(type,amountCents);
+ // Commission is calculated on the server; ignore any amount sent by the browser.
  const result=db.prepare('INSERT INTO mpesa_transactions(txn_ref,txn_type,amount_cents,commission_cents,customer_name,phone,notes,user_id) VALUES(?,?,?,?,?,?,?,?)')
- .run(ref,type,cents(b.amount),cents(b.commission||0),String(b.customerName||''),String(b.phone||''),String(b.notes||''),req.session.user.id);
- log(req.session.user.id,'MPESA_RECORDED',`${ref}; ${type}; amount=${b.amount}`); res.status(201).json({id:result.lastInsertRowid});
+ .run(ref,type,amountCents,calculated.commissionCents,String(b.customerName||''),String(b.phone||''),String(b.notes||''),req.session.user.id);
+ log(req.session.user.id,'MPESA_RECORDED',`${ref}; ${type}; amount=${b.amount}; commission=${money(calculated.commissionCents)}; matched=${calculated.matched}`); res.status(201).json({id:result.lastInsertRowid,commission:money(calculated.commissionCents),commissionMatched:calculated.matched,band:calculated.band||null});
 }));
 
 app.get('/api/expenses', signedIn, adminOnly, (req,res) => res.json(db.prepare('SELECT e.*,u.display_name FROM expenses e JOIN users u ON u.id=e.user_id ORDER BY e.id DESC LIMIT 300').all().map(e=>({...e,amount:money(e.amount_cents)}))));
@@ -313,10 +362,12 @@ app.post('/api/expenses', signedIn, adminOnly, wrap((req,res) => {
 }));
 app.get('/api/reports', signedIn, adminOnly, (req,res) => {
  const sales=db.prepare('SELECT COUNT(*) count,COALESCE(SUM(total_cents),0) total,COALESCE(SUM(paid_cents),0) paid FROM sales').get();
+ const saleCost=db.prepare('SELECT COALESCE(SUM(si.unit_cost_cents*si.quantity),0) n FROM sale_items si JOIN sales s ON s.id=si.sale_id WHERE NOT EXISTS (SELECT 1 FROM sale_items old WHERE old.sale_id=s.id AND old.cost_snapshot_known=0)').get().n;
+ const salesWithKnownCost=db.prepare('SELECT COUNT(*) n FROM sales s WHERE EXISTS(SELECT 1 FROM sale_items si WHERE si.sale_id=s.id) AND NOT EXISTS(SELECT 1 FROM sale_items si WHERE si.sale_id=s.id AND si.cost_snapshot_known=0)').get().n;
  const stock=db.prepare('SELECT COUNT(*) products,COALESCE(SUM(quantity*cost_cents),0) value,COALESCE(SUM(quantity),0) units FROM products WHERE active=1').get();
  const mpesa=db.prepare('SELECT COUNT(*) count,COALESCE(SUM(amount_cents),0) amount,COALESCE(SUM(commission_cents),0) commission FROM mpesa_transactions').get();
  const repairs=db.prepare('SELECT COUNT(*) count,COALESCE(SUM(quote_cents),0) quoted,COALESCE(SUM(paid_cents),0) paid FROM repairs').get();
- res.json({sales:{count:sales.count,total:money(sales.total),paid:money(sales.paid)},stock:{products:stock.products,units:stock.units,value:money(stock.value)},mpesa:{count:mpesa.count,amount:money(mpesa.amount),commission:money(mpesa.commission)},repairs:{count:repairs.count,quoted:money(repairs.quoted),paid:money(repairs.paid)}});
+ res.json({sales:{count:sales.count,total:money(sales.total),paid:money(sales.paid),costOfGoodsSold:money(saleCost),grossProfit:money(db.prepare('SELECT COALESCE(SUM(s.total_cents-(SELECT SUM(si.unit_cost_cents*si.quantity) FROM sale_items si WHERE si.sale_id=s.id)),0) n FROM sales s WHERE EXISTS(SELECT 1 FROM sale_items si WHERE si.sale_id=s.id) AND NOT EXISTS(SELECT 1 FROM sale_items si WHERE si.sale_id=s.id AND si.cost_snapshot_known=0)').get().n),salesWithKnownCost},stock:{products:stock.products,units:stock.units,value:money(stock.value)},mpesa:{count:mpesa.count,amount:money(mpesa.amount),commission:money(mpesa.commission)},repairs:{count:repairs.count,quoted:money(repairs.quoted),paid:money(repairs.paid)}});
 });
 app.get('/api/users', signedIn, adminOnly, (req,res) => res.json(db.prepare('SELECT id,username,display_name,role,active,created_at FROM users ORDER BY id').all()));
 app.post('/api/users', signedIn, adminOnly, wrap((req,res) => {
