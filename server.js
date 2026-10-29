@@ -11,6 +11,8 @@ const fs = require('fs');
 const crypto = require('crypto');
 
 const app = express();
+// Render terminates HTTPS at its proxy. Trust the proxy so secure session cookies work.
+if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT || 3000);
 if (process.env.NODE_ENV === 'production' && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) {
   throw new Error('Set SESSION_SECRET to a unique random value of at least 32 characters in production.');
@@ -204,7 +206,11 @@ app.post('/api/login', loginLimiter, wrap((req,res) => {
   if (err) return res.status(500).json({error:'Could not create session.'});
   req.session.user = safeUser(user);
   log(user.id,'LOGIN','Signed in');
-  res.json({user:req.session.user});
+  // Persist the session before replying, so the dashboard's next request can use it.
+  req.session.save(saveErr => {
+   if (saveErr) { console.error('Session save failed:', saveErr); return res.status(500).json({error:'Could not save sign-in session. Please try again.'}); }
+   res.json({user:req.session.user});
+  });
  });
 }));
 app.post('/api/logout', signedIn, (req,res) => { const id=req.session.user.id; log(id,'LOGOUT','Signed out'); req.session.destroy(()=>res.json({ok:true})); });
